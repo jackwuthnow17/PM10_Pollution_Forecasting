@@ -1,0 +1,138 @@
+---
+title: "Group 3 Pollution Project"
+author: "Jack Wuthnow"
+date: "2026-03-12"
+output: html_document
+---
+
+
+Loading in the intial csv into R as the variable 'data'.
+```{r}
+library(tidyverse)
+data<- read_csv("Data_Guanyuan.csv")
+```
+Combined the year, month, day, and hour columns into a datetime variable for chronological ordering.
+```{r}
+library(zoo)
+library(lubridate)
+
+data <- data %>%
+  mutate(datetime = make_datetime(year, month, day, hour))
+```
+
+
+We handled NA values in the dataset by first filling in gaps in the numeric variables. Using linear interpolation we estimated missing values based on the surrounding data. For the categorical variable wd (wind direction), we filled missing entries by carrying the last known value forward and backward to maintain consistency. Finally, we checked all columns to see ensure the proccess of removing NA values worked.”
+```{r}
+numeric_cols <- c("PM10","SO2","NO2","CO","O3","TEMP","PRES","DEWP","RAIN","WSPM")
+
+data <- data %>%
+  arrange(datetime) %>%
+  mutate(across(all_of(numeric_cols), ~ na.approx(.x, na.rm = FALSE)))
+
+data <- data %>%
+  arrange(datetime) %>%
+  fill(wd, .direction = "downup")
+
+colSums(is.na(data))
+```
+
+We identified outliers in PM10 using the interquartile range (IQR) method. Values below Q1 − 1.5IQR or above Q3 + 1.5IQR were classified as such. These outlier values were replaced with NA so they could be interpolated later, and colSums() showed us there were 1239 classifications.”
+```{r}
+Q1 <- quantile(data$PM10, 0.25, na.rm = TRUE)
+Q3 <- quantile(data$PM10, 0.75, na.rm = TRUE)
+IQR_val <- Q3 - Q1
+
+lower <- Q1 - 1.5 * IQR_val
+upper <- Q3 + 1.5 * IQR_val
+
+data <- data %>%
+  mutate(PM10 = if_else(PM10 < lower | PM10 > upper, NA_real_, PM10))
+colSums(is.na(data))
+```
+
+Performed another round of linear interpolation to fill in the NA values that were created by replacing outliers.
+```{r}
+data <- data %>%
+  arrange(datetime) %>%
+  mutate(PM10 = na.approx(PM10, na.rm = FALSE))
+colSums(is.na(data))
+```
+Hourly data was aggregated to daily values by first creating a date column from the datetime. For each day, all numeric variables were averaged to obtain daily means. The categorical variable wd was represented by the most frequent value of the day. This results in a clean, daily-level dataset where each row corresponds to a specific day and includes all relevant predictors for PM10 forecasting.”
+```{r}
+data <- data %>%
+  mutate(date = as.Date(datetime))
+
+daily_data <- data %>%
+  mutate(date = as.Date(datetime)) %>%  
+  group_by(date) %>%
+  summarise(
+    PM10 = mean(PM10, na.rm = TRUE),
+    SO2 = mean(SO2, na.rm = TRUE),
+    NO2 = mean(NO2, na.rm = TRUE),
+    CO = mean(CO, na.rm = TRUE),
+    O3 = mean(O3, na.rm = TRUE),
+    TEMP = mean(TEMP, na.rm = TRUE),
+    PRES = mean(PRES, na.rm = TRUE),
+    DEWP = mean(DEWP, na.rm = TRUE),
+    RAIN = mean(RAIN, na.rm = TRUE),
+    WSPM = mean(WSPM, na.rm = TRUE),
+    wd = names(sort(table(wd), decreasing = TRUE))[1],
+    .groups = "drop"
+  )
+```
+
+Lag variables were created to include previous days PM10 values as predictors for forecasting tomorrow. Specifically, yesterday’s PM10,the PM10 from two days ago, and PM10 from the same day last week.
+```{r}
+daily_data <- daily_data %>%
+  arrange(date) %>%                       
+  mutate(
+    PM10_lag1 = lag(PM10, 1),           
+    PM10_lag2 = lag(PM10, 2),            
+    PM10_lag7 = lag(PM10, 7)             
+  )
+```
+
+```{r}
+data <- data %>%
+  mutate(
+    hour = hour(datetime),
+    day_of_week = weekdays(datetime),
+    month = month(datetime, label = TRUE)
+  )
+```
+
+```{r}
+hourly_trend <- data %>%
+  group_by(hour) %>%
+  summarise(avg_PM10 = mean(PM10, na.rm = TRUE))
+
+ggplot(hourly_trend, aes(x = hour, y = avg_PM10)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Average PM10 by Hour of Day",
+    x = "Hour",
+    y = "Average PM10"
+  ) +
+  theme_minimal()
+```
+```{r}
+dow_trend <- data %>%
+  group_by(day_of_week) %>%
+  summarise(avg_PM10 = mean(PM10, na.rm = TRUE))
+
+dow_trend$day_of_week <- factor(
+  dow_trend$day_of_week,
+  levels = c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+)
+
+ggplot(dow_trend, aes(x = day_of_week, y = avg_PM10)) +
+  geom_col() +
+  labs(
+    title = "Average PM10 by Day of Week",
+    x = "Day",
+    y = "Average PM10"
+  ) +
+  theme_minimal()
+```
+
