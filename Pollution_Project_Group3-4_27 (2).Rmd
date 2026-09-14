@@ -1,0 +1,408 @@
+---
+title: "Group 3 Pollution Project"
+author: "Jack Wuthnow, Weidai(David) He"
+date: "2026-03-12"
+output: html_document
+---
+
+
+Loading in the intial csv into R as the variable 'data'.
+```{r}
+library(tidyverse)
+data<- read_csv("Data_Guanyuan.csv")
+```
+Combined the year, month, day, and hour columns into a datetime variable for chronological ordering.
+```{r}
+library(zoo)
+library(lubridate)
+
+data <- data %>%
+  mutate(datetime = make_datetime(year, month, day, hour))
+```
+
+
+We handled NA values in the dataset by first filling in gaps in the numeric variables. Using linear interpolation we estimated missing values based on the surrounding data. For the categorical variable wd (wind direction), we filled missing entries by carrying the last known value forward and backward to maintain consistency. Finally, we checked all columns to see ensure the proccess of removing NA values worked.”
+```{r}
+numeric_cols <- c("PM10","SO2","NO2","CO","O3","TEMP","PRES","DEWP","RAIN","WSPM")
+
+data <- data %>%
+  arrange(datetime) %>%
+  mutate(across(all_of(numeric_cols), ~ na.approx(.x, na.rm = FALSE)))
+
+data <- data %>%
+  arrange(datetime) %>%
+  fill(wd, .direction = "downup")
+
+colSums(is.na(data))
+```
+
+We identified outliers in PM10 using the interquartile range (IQR) method. Values below Q1 − 1.5IQR or above Q3 + 1.5IQR were classified as such. These outlier values were replaced with NA so they could be interpolated later, and colSums() showed us there were 1239 classifications.”
+```{r}
+Q1 <- quantile(data$PM10, 0.25, na.rm = TRUE)
+Q3 <- quantile(data$PM10, 0.75, na.rm = TRUE)
+IQR_val <- Q3 - Q1
+
+lower <- Q1 - 1.5 * IQR_val
+upper <- Q3 + 1.5 * IQR_val
+
+data <- data %>%
+  mutate(PM10 = if_else(PM10 < lower | PM10 > upper, NA_real_, PM10))
+colSums(is.na(data))
+```
+
+Performed another round of linear interpolation to fill in the NA values that were created by replacing outliers.
+```{r}
+data <- data %>%
+  arrange(datetime) %>%
+  mutate(PM10 = na.approx(PM10, na.rm = FALSE))
+colSums(is.na(data))
+```
+Hourly data was aggregated to daily values by first creating a date column from the datetime. For each day, all numeric variables were averaged to obtain daily means. The categorical variable wd was represented by the most frequent value of the day. This results in a clean, daily-level dataset where each row corresponds to a specific day and includes all relevant predictors for PM10 forecasting.”
+```{r}
+data <- data %>%
+  mutate(date = as.Date(datetime))
+
+daily_data <- data %>%
+  mutate(date = as.Date(datetime)) %>%  
+  group_by(date) %>%
+  summarise(
+    PM10 = mean(PM10, na.rm = TRUE),
+    SO2 = mean(SO2, na.rm = TRUE),
+    NO2 = mean(NO2, na.rm = TRUE),
+    CO = mean(CO, na.rm = TRUE),
+    O3 = mean(O3, na.rm = TRUE),
+    TEMP = mean(TEMP, na.rm = TRUE),
+    PRES = mean(PRES, na.rm = TRUE),
+    DEWP = mean(DEWP, na.rm = TRUE),
+    RAIN = mean(RAIN, na.rm = TRUE),
+    WSPM = mean(WSPM, na.rm = TRUE),
+    wd = names(sort(table(wd), decreasing = TRUE))[1],
+    .groups = "drop"
+  )
+```
+
+Lag variables were created to include previous days PM10 values as predictors for forecasting tomorrow. Specifically, yesterday’s PM10,the PM10 from two days ago, and PM10 from the same day last week.
+```{r}
+daily_data <- daily_data %>%
+  arrange(date) %>%                       
+  mutate(
+    PM10_lag1 = lag(PM10, 1),           
+    PM10_lag2 = lag(PM10, 2),            
+    PM10_lag7 = lag(PM10, 7)             
+  )
+```
+
+# Prepare Data for Modeling
+```{r}
+model_data <- daily_data %>%
+  drop_na(PM10_lag1, PM10_lag2, PM10_lag7)
+```
+
+# Train-Test Split (Time Series)
+```{r}
+split_index <- floor(0.8 * nrow(model_data))
+
+train <- model_data[1:split_index, ]
+test  <- model_data[(split_index + 1):nrow(model_data), ]
+```
+
+#Baseline model
+The naïve model assumes tomorrow's PM10 equals today's PM10.
+
+$PM10_{t+1}=PM10_t$
+```{r}
+naive_pred <- test$PM10_lag1
+```
+
+### Simple Linear Regression
+```{r}
+lm_simple <- lm(PM10 ~ PM10_lag1, data = train)
+
+simple_pred <- predict(lm_simple, newdata = test)
+
+summary(lm_simple)
+```
+
+
+### Multiple Linear Regression
+```{r}
+lm_multiple <- lm(
+  PM10 ~ PM10_lag1 + PM10_lag2 + PM10_lag7 + TEMP + PRES + DEWP + RAIN + WSPM + SO2 + NO2 + CO + O3,
+  data = train
+)
+
+multiple_pred <- predict(lm_multiple, newdata = test)
+
+summary(lm_multiple)
+```
+```{r}
+MAE <- function(actual, pred){
+  mean(abs(actual - pred))
+}
+
+RMSE <- function(actual, pred){
+  sqrt(mean((actual - pred)^2))
+}
+
+R2 <- function(actual, pred){
+  cor(actual, pred)^2
+}
+```
+
+```{r}
+results <- data.frame(
+  Model = c("Naive", "Simple Linear Regression", "Multiple Linear Regression"),
+  MAE = c(
+    MAE(test$PM10, naive_pred),
+    MAE(test$PM10, simple_pred),
+    MAE(test$PM10, multiple_pred)
+  ),
+  RMSE = c(
+    RMSE(test$PM10, naive_pred),
+    RMSE(test$PM10, simple_pred),
+    RMSE(test$PM10, multiple_pred)
+  ),
+  R2 = c(
+    R2(test$PM10, naive_pred),
+    R2(test$PM10, simple_pred),
+    R2(test$PM10, multiple_pred)
+  )
+)
+
+results
+```
+
+Naïve Model
+
+The naïve model assumes that tomorrow’s PM10 concentration will be equal to today's level. This approach serves as a baseline benchmark for evaluating more complex models. The naïve model produced a MAE of 44.58 and RMSE of 60.01, indicating relatively large prediction errors. The $R^2$ value of 0.321 suggests that the model explains only about 32% of the variation in PM10 levels.
+
+Simple Linear Regression
+
+The simple linear regression model uses the previous day’s PM10 concentration as the sole predictor. This model slightly improves prediction accuracy compared to the naïve model, reducing MAE to 41.95 and RMSE to 53.24. However, the $R^2$ remains approximately 0.321, meaning the model still explains only about 32% of the variance in PM10. This suggests that while PM10 exhibits temporal persistence, using only the previous day’s value is insufficient to capture the full dynamics of air pollution levels.
+
+Multiple Linear Regression
+
+The multiple linear regression model incorporates additional predictors including lagged PM10 values and meteorological variables such as temperature, pressure, wind speed, rainfall, and other pollutant concentrations. This model significantly improves prediction accuracy, achieving a MAE of 22.13 and RMSE of 29.09, which represents nearly a 50% reduction in error compared to the naïve model. Furthermore, the $R^2$ increases to 0.799, indicating that the model explains approximately 80% of the variation in PM10 concentrations.
+
+This substantial improvement suggests that weather conditions and other pollutants play an important role in determining PM10 levels, and incorporating these variables greatly enhances forecasting 
+
+
+```{r}
+library(forecast)
+library(tseries)
+pm10_ts <- ts(model_data$PM10, frequency = 365)
+
+adf.test(pm10_ts)
+arima_model <- auto.arima(pm10_ts)
+
+summary(arima_model)
+
+train_ts <- ts(train$PM10, frequency = 365)
+test_ts  <- ts(test$PM10, frequency = 365)
+
+# Fit ARIMA on Training Data
+arima_model <- auto.arima(train_ts)
+
+summary(arima_model)
+```
+
+```{r}
+arima_forecast <- forecast(arima_model, h = length(test_ts))
+
+arima_pred <- as.numeric(arima_forecast$mean)
+arima_results <- data.frame(
+  Model = "ARIMA",
+  MAE = MAE(test$PM10, arima_pred),
+  RMSE = RMSE(test$PM10, arima_pred),
+  R2 = R2(test$PM10, arima_pred)
+)
+
+arima_results
+```
+
+```{r}
+results_all <- rbind(results, arima_results)
+
+results_all
+```
+
+
+
+--- Tying in Advanced Modeling --- 
+
+
+XGBoost Model:
+```{r}
+library(xgboost)
+
+train_xgb <- train %>%
+  dplyr::select(PM10, PM10_lag1, PM10_lag2, PM10_lag7,
+                TEMP, PRES, DEWP, RAIN, WSPM, SO2, NO2, CO, O3)
+
+test_xgb <- test %>%
+  dplyr::select(PM10, PM10_lag1, PM10_lag2, PM10_lag7,
+                TEMP, PRES, DEWP, RAIN, WSPM, SO2, NO2, CO, O3)
+
+train_matrix <- model.matrix(PM10 ~ ., data = train_xgb)
+test_matrix  <- model.matrix(PM10 ~ ., data = test_xgb)
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train$PM10)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective = "reg:squarederror",
+    max_depth = 4,
+    eta = 0.1
+  ),
+  data = dtrain,
+  nrounds = 50,
+  verbose = 0
+)
+xgb_pred <- predict(xgb_model, newdata = test_matrix)
+```
+
+
+XGBoost Evaluation
+```{r}
+xgb_results <- data.frame(
+  Model = "XGBoost",
+  MAE = MAE(test$PM10, xgb_pred),
+  RMSE = RMSE(test$PM10, xgb_pred),
+  R2 = R2(test$PM10, xgb_pred)
+)
+
+results_final <- rbind(results_all, xgb_results)
+
+results_final
+```
+
+
+Visuals
+```{r}
+plot(test$PM10, type = "l", col = "black", lwd = 2,
+     main = "Actual vs Predicted PM10",
+     ylab = "PM10", xlab = "Time")
+
+lines(multiple_pred, col = "blue", lwd = 2)
+lines(xgb_pred, col = "red", lwd = 2)
+
+legend("topright",
+       legend = c("Actual", "Linear Regression", "XGBoost"),
+       col = c("black", "blue", "red"),
+       lty = 1)
+```
+
+
+Advanced Modeling Motivation:
+
+While the baseline models, particularly the multiple linear regression model, show strong performance, they rely on linear relationships between predictors and PM10 levels. However, air pollution dynamics may involve nonlinear interactions and complex patterns.
+To explore whether a more flexible modeling approach can improve prediction accuracy, we implement an XGBoost model and compare its performance to the baseline models.
+
+
+Importance:
+```{r}
+importance <- xgb.importance(model = xgb_model)
+importance
+```
+The feature importance results indicate that lagged PM10 variables are the most influential predictors. This reinforces the strong temporal dependence in air pollution levels, where recent PM10 values play a dominant role in predicting future values. 
+
+
+Accuracy Insights:
+
+The results demonstrate that model performance improves significantly as more relevant predictors are incorporated. The naive and simple linear regression models perform poorly, indicating that relying solely on past PM10 values is insufficient for accurate forecasting.
+
+The multiple linear regression model achieves a substantial improvement in accuracy, reducing both MAE and RMSE by nearly 50% compared to the naïve model. This highlights the importance of including meteorological variables and additional pollutant measures in predicting PM10 levels.
+
+When comparing the advanced XGBoost model to the multiple linear regression model, the performance differences are relatively small. This suggests that most of the predictive signal is already captured by the linear relationships and strong temporal dependence in the data.
+
+Additionally, the slightly higher RMSE relative to MAE across models indicates the presence of occasional large prediction errors, likely corresponding to extreme pollution events. Overall, the results show that while advanced machine learning models provide flexibility, the inclusion of meaningful features has a greater impact on prediction accuracy than increased model complexity.
+
+
+Sample Prediction:
+
+```{r}
+predict_pm10_from_values <- function(
+  PM10_lag1,
+  PM10_lag2,
+  PM10_lag7,
+  TEMP,
+  PRES,
+  DEWP,
+  RAIN,
+  WSPM,
+  SO2,
+  NO2,
+  CO,
+  O3,
+  lm_fit,
+  xgb_fit,
+  train_matrix
+) {
+  
+  new_data <- data.frame(
+    PM10_lag1 = PM10_lag1,
+    PM10_lag2 = PM10_lag2,
+    PM10_lag7 = PM10_lag7,
+    TEMP = TEMP,
+    PRES = PRES,
+    DEWP = DEWP,
+    RAIN = RAIN,
+    WSPM = WSPM,
+    SO2 = SO2,
+    NO2 = NO2,
+    CO = CO,
+    O3 = O3
+  )
+  
+  # Linear model prediction
+  lm_pred <- predict(lm_fit, newdata = new_data)
+  
+  # Build XGBoost matrix
+  new_matrix <- model.matrix(~ ., data = new_data)
+  
+  # Add missing columns
+  missing_cols <- setdiff(colnames(train_matrix), colnames(new_matrix))
+  for (col in missing_cols) {
+    new_matrix <- cbind(new_matrix, 0)
+    colnames(new_matrix)[ncol(new_matrix)] <- col
+  }
+  
+  # Match column order
+  new_matrix <- new_matrix[, colnames(train_matrix), drop = FALSE]
+  
+  # XGBoost prediction
+  xgb_pred <- predict(xgb_fit, newdata = new_matrix)
+  
+  # Return result
+  data.frame(
+    LM_Prediction = round(lm_pred, 2),
+    XGB_Prediction = round(xgb_pred, 2)
+  )
+}
+```
+
+```{r}
+predict_pm10_from_values(
+  PM10_lag1 = 80,
+  PM10_lag2 = 75,
+  PM10_lag7 = 70,
+  TEMP = 15,
+  PRES = 1010,
+  DEWP = 5,
+  RAIN = 0,
+  WSPM = 2.5,
+  SO2 = 10,
+  NO2 = 40,
+  CO = 1.0,
+  O3 = 60,
+  lm_fit = lm_multiple,
+  xgb_fit = xgb_model,
+  train_matrix = train_matrix
+)
+```
+
+
+The sample prediction demonstrates how the trained models can be used to estimate PM10 levels for new data. First, the user inputs values such as recent PM10 levels and environmental conditions. These inputs are formatted to match the structure of the training data. The linear regression model directly uses these inputs to generate a prediction, while the XGBoost model first converts the inputs into a matrix format consistent with how it was trained. Both models then output predicted PM10 values, showing how the learned relationships from historical data can be applied to new scenarios.
+
+
+
